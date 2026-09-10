@@ -55,9 +55,8 @@ if [ ! -d "${ISO_DIR_WRITABLE}" ]; then
     mkdir -p "${ISO_DIR_WRITABLE}"
 fi
 
-# Build mirror registry args for oc image extract so that disconnected
-# clusters resolve images through local mirrors (IDMS) instead of
-# reaching out to the upstream registry directly.
+# Build mirror registry args for oc so that disconnected clusters resolve
+# images through local mirrors (IDMS) instead of the upstream registry.
 # Populates the mirror_args array; callers expand with "${mirror_args[@]}".
 build_mirror_args() {
     mirror_args=()
@@ -91,34 +90,32 @@ verify_iso_checksum() {
 # Extract cross-arch aarch64 ISOs for all available CoreOS versions.
 if [[ "${arch}" == "x86_64" ]]; then
     MACHINE_OS_IMAGES_IMAGE="${MACHINE_OS_IMAGES_IMAGE:-}"
-    RELEASE_IMAGE="${RELEASE_IMAGE:-}"
 
     if [ -n "${MACHINE_OS_IMAGES_IMAGE}" ]; then
         base64 -d /run/secrets/pull-secret > /run/secrets/auth.json
         build_mirror_args
 
-        # CBO sets RELEASE_IMAGE. oc adm release info honors --idms-file
-        # (oc image info does not). listDigest means a multi-arch payload;
-        # missing ISO is then fatal. No digest, or older CBO, keeps the
-        # extract-and-skip path used by single-arch CI.
+        # oc image info --idms-file (openshift/oc#2397) uses Explicit so it
+        # does not dial the source registry first. linux/arm64 present means
+        # a missing ISO is fatal. No arm64 keeps skip. Inspect failure
+        # (stock oc without the flag) keeps extract-and-skip for CI.
         require_iso=false
         skip_extract=false
-        if [ -n "${RELEASE_IMAGE}" ]; then
-            if release_json="$(oc adm release info \
-                --certificate-authority=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
-                --registry-config=/run/secrets/auth.json \
-                -o json \
-                "${mirror_args[@]}" \
-                "${RELEASE_IMAGE}")"; then
-                if echo "${release_json}" | jq -e '.listDigest != null and .listDigest != ""' >/dev/null; then
-                    require_iso=true
-                else
-                    echo "${RELEASE_IMAGE} is not a multi-arch payload. Skipping aarch64 iso extraction." >&2
-                    skip_extract=true
-                fi
+        if image_info="$(oc image info \
+            --certificate-authority=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+            --registry-config=/run/secrets/auth.json \
+            --show-multiarch \
+            -o json \
+            "${mirror_args[@]}" \
+            "${MACHINE_OS_IMAGES_IMAGE}")"; then
+            if echo "${image_info}" | jq -e '(if type == "array" then .[] else . end) | select(.config.os == "linux" and .config.architecture == "arm64")' >/dev/null; then
+                require_iso=true
             else
-                echo "failed to inspect ${RELEASE_IMAGE}. Extracting without an arch check." >&2
+                echo "${MACHINE_OS_IMAGES_IMAGE} has no linux/arm64 variant. Skipping aarch64 iso extraction." >&2
+                skip_extract=true
             fi
+        else
+            echo "failed to inspect ${MACHINE_OS_IMAGES_IMAGE}. Extracting without an arch check." >&2
         fi
 
         if [ "${skip_extract}" != true ]; then
